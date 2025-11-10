@@ -1,3 +1,10 @@
+THIS DOES NOT WORK, 
+
+It does send to GPU but hash outputs are incorrect! Its probably closer than I think but I dont have time. 
+
+there are multiple readmes if anyone wants to continue this on feel free to DM me.
+
+
 # Midnight Fetcher Bot
 
 APPLICATION BROUGHT TO YOU BY PADDY https://x.com/PoolShamrock AND PAUL https://x.com/cwpaulm

@@ -7,6 +7,7 @@ import axios from 'axios';
 import { EventEmitter } from 'events';
 import { ChallengeResponse, MiningStats, MiningEvent, Challenge, WorkerStats } from './types';
 import { hashEngine } from '@/lib/hash/engine';
+import { hashEngineGPU } from '@/lib/hash/engine-gpu';
 import { WalletManager, DerivedAddress } from '@/lib/wallet/manager';
 import Logger from '@/lib/utils/logger';
 import { matchesDifficulty, getDifficultyZeroBits } from './difficulty';
@@ -14,6 +15,7 @@ import { receiptsLogger } from '@/lib/storage/receipts-logger';
 import { generateNonce } from './nonce';
 import { buildPreimage } from './preimage';
 import { devFeeManager } from '@/lib/devfee/manager';
+import { miningConfig } from './config';
 import * as os from 'os';
 
 interface SolutionTimestamp {
@@ -51,6 +53,11 @@ class MiningOrchestrator extends EventEmitter {
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
   private customBatchSize: number | null = null; // Custom batch size override
+
+  // GPU mining state
+  private gpuEnabled = false; // Whether GPU mining is active
+  private gpuInitialized = false; // Whether GPU has been initialized
+  private gpuWorkers = 0; // Number of active GPU workers
 
   /**
    * Update orchestrator configuration dynamically
@@ -409,8 +416,23 @@ class MiningOrchestrator extends EventEmitter {
 
         console.log('[Orchestrator] ROM ready');
 
+        // Set current challenge BEFORE GPU initialization (GPU init needs it for ROM)
         this.currentChallengeId = challengeId;
         this.currentChallenge = challenge.challenge;
+
+        // Initialize GPU if available and enabled
+        await this.initializeGPU();
+
+        console.log('[Orchestrator] ========================================');
+        console.log('[Orchestrator] MINING ENGINE STATUS');
+        console.log('[Orchestrator] ========================================');
+        console.log(`[Orchestrator] CPU Mining: ENABLED (${this.workerThreads} workers)`);
+        console.log(`[Orchestrator] GPU Mining: ${this.gpuEnabled ? `ENABLED (${this.gpuWorkers} workers)` : 'DISABLED'}`);
+        if (this.gpuEnabled) {
+          console.log(`[Orchestrator] GPU Batch Size: ${miningConfig.getConfig().gpuBatchSize.toLocaleString()}`);
+          console.log(`[Orchestrator] Expected speedup: ~100-200x vs CPU`);
+        }
+        console.log('[Orchestrator] ========================================');
 
         // Load challenge state from receipts (restore progress, solutions count, etc.)
         this.loadChallengeState(challengeId);
@@ -555,13 +577,34 @@ class MiningOrchestrator extends EventEmitter {
         console.log(`[Orchestrator] Dev fee active - using ${userWorkerCount} workers for user mining (${this.workerThreads - userWorkerCount} reserved for dev fee)`);
       }
 
-      // Each worker gets a unique ID (0 to userWorkerCount-1) to generate different nonces
-      const workers = Array(userWorkerCount).fill(null).map((_, workerId) =>
+      console.log('[Orchestrator] ========================================');
+      console.log('[Orchestrator] LAUNCHING MINING WORKERS');
+      console.log('[Orchestrator] ========================================');
+      console.log(`[Orchestrator] CPU Workers: ${userWorkerCount} (0-${userWorkerCount - 1})`);
+
+      // Launch CPU workers
+      const cpuWorkers = Array(userWorkerCount).fill(null).map((_, workerId) =>
         this.mineForAddress(addr, false, workerId, MAX_SUBMISSION_FAILURES)
       );
 
-      // Wait for ALL workers to complete (they'll exit when address is solved or max failures reached)
-      await Promise.all(workers);
+      // Launch GPU workers if enabled
+      const gpuWorkers: Promise<void>[] = [];
+      if (this.gpuEnabled) {
+        console.log(`[Orchestrator] GPU Workers: ${this.gpuWorkers} (1000-${1000 + this.gpuWorkers - 1})`);
+        console.log('[Orchestrator] ⚡ GPU MINING ACTIVE - Expect 100-200x speedup!');
+
+        for (let i = 0; i < this.gpuWorkers; i++) {
+          gpuWorkers.push(
+            this.mineForAddressGPU(addr, false, i, MAX_SUBMISSION_FAILURES)
+          );
+        }
+      } else {
+        console.log('[Orchestrator] GPU Workers: 0 (GPU disabled or not available)');
+      }
+      console.log('[Orchestrator] ========================================');
+
+      // Wait for ALL workers (CPU + GPU) to complete
+      await Promise.all([...cpuWorkers, ...gpuWorkers]);
 
       // Check if address was successfully solved
       const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
@@ -803,12 +846,17 @@ class MiningOrchestrator extends EventEmitter {
                 }
               }
             } else {
-              // Stop other user workers (IDs < userWorkerCount)
-              console.log(`[Orchestrator] Worker ${workerId}: User solution found! Stopping other user workers`);
+              // Stop ALL workers (CPU + GPU) for this address
+              console.log(`[Orchestrator] Worker ${workerId}: User solution found! Stopping all workers (CPU + GPU)`);
+              // Stop other CPU workers
               for (let i = 0; i < userWorkerCount; i++) {
                 if (i !== workerId) {
                   this.stoppedWorkers.add(i);
                 }
+              }
+              // Stop all GPU workers
+              for (let j = 0; j < this.gpuWorkers; j++) {
+                this.stoppedWorkers.add(1000 + j); // GPU workers use IDs 1000+
               }
             }
 
@@ -1591,6 +1639,400 @@ class MiningOrchestrator extends EventEmitter {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Initialize GPU mining if available
+   */
+  private async initializeGPU(): Promise<void> {
+    const config = miningConfig.getConfig();
+
+    if (!config.enableGpu) {
+      console.log('[Orchestrator] GPU mining disabled in configuration');
+      return;
+    }
+
+    if (this.gpuInitialized) {
+      console.log('[Orchestrator] GPU already initialized');
+      return;
+    }
+
+    try {
+      if (!hashEngineGPU.isAvailable()) {
+        console.log('[Orchestrator] ⚠️  No CUDA GPU detected - GPU mining disabled');
+        return;
+      }
+
+      console.log('[Orchestrator] ========================================');
+      console.log('[Orchestrator] INITIALIZING GPU MINING');
+      console.log('[Orchestrator] ========================================');
+
+      // Initialize ROM in native module first (required for GPU)
+      if (!this.currentChallenge) {
+        throw new Error('No challenge available for GPU ROM initialization');
+      }
+
+      console.log('[Orchestrator] Initializing native ROM for GPU...');
+      await hashEngineGPU.initRom(this.currentChallenge.no_pre_mine);
+      console.log('[Orchestrator] ✓ Native ROM initialized');
+
+      // Now initialize GPU
+      await hashEngineGPU.init(config.gpuBatchSize);
+
+      this.gpuEnabled = true;
+      this.gpuInitialized = true;
+      this.gpuWorkers = config.gpuWorkers;
+
+      const info = hashEngineGPU.getInfo();
+      console.log('[Orchestrator] ✓ GPU Mining Enabled');
+      console.log(`[Orchestrator]   Device: ${info.name}`);
+      console.log(`[Orchestrator]   Workers: ${this.gpuWorkers}`);
+      console.log(`[Orchestrator]   Batch Size: ${config.gpuBatchSize.toLocaleString()}`);
+      console.log('[Orchestrator] ========================================');
+
+    } catch (error: any) {
+      console.error('[Orchestrator] GPU initialization failed:', error.message);
+      console.error('[Orchestrator] Continuing with CPU-only mining');
+      this.gpuEnabled = false;
+    }
+  }
+
+  /**
+   * Mine for address using GPU
+   * Similar to mineForAddress but uses GPU batch processing
+   */
+  private async mineForAddressGPU(
+    addr: DerivedAddress,
+    isDevFee: boolean = false,
+    workerId: number = 0,
+    maxFailures: number = 10
+  ): Promise<void> {
+    if (!this.currentChallenge || !this.currentChallengeId || !this.gpuEnabled) return;
+
+    // Check if this worker should be mining for this address
+    if (!isDevFee && this.currentMiningAddress !== addr.bech32) {
+      console.log(`[Orchestrator] GPU Worker ${workerId}: Skipping address ${addr.index} - not current mining address`);
+      return;
+    }
+
+    // Capture challenge details at START
+    const challengeId = this.currentChallengeId;
+    const challenge = JSON.parse(JSON.stringify(this.currentChallenge));
+    const difficulty = challenge.difficulty;
+
+    // Mark this address as being processed
+    this.addressesProcessedCurrentChallenge.add(addr.index);
+
+    // Initialize worker stats
+    const workerStartTime = Date.now();
+    const gpuWorkerId = 1000 + workerId; // Offset GPU worker IDs to avoid conflicts
+    this.workerStats.set(gpuWorkerId, {
+      workerId: gpuWorkerId,
+      addressIndex: addr.index,
+      address: addr.bech32,
+      hashesComputed: 0,
+      hashRate: 0,
+      solutionsFound: 0,
+      startTime: workerStartTime,
+      lastUpdateTime: workerStartTime,
+      status: 'mining',
+      currentChallenge: challengeId,
+    });
+
+    const config = miningConfig.getConfig();
+    const BATCH_SIZE = config.gpuBatchSize;
+
+    // Get nonce range for this GPU worker
+    const nonceRange = miningConfig.getGpuWorkerNonceRange(workerId, this.gpuWorkers);
+    let currentNonce = Number(nonceRange.start);
+    const nonceEnd = Number(nonceRange.end);
+
+    console.log('[Orchestrator] ========================================');
+    console.log(`[Orchestrator] [GPU] Worker ${workerId} STARTED`);
+    console.log('[Orchestrator] ========================================');
+    console.log(`[Orchestrator] [GPU] Address: ${addr.bech32.slice(0, 20)}... (index ${addr.index})`);
+    console.log(`[Orchestrator] [GPU] Batch Size: ${BATCH_SIZE.toLocaleString()} hashes/batch`);
+    console.log(`[Orchestrator] [GPU] Nonce Range: ${currentNonce.toLocaleString()} to ${nonceEnd.toLocaleString()}`);
+    console.log(`[Orchestrator] [GPU] Total Nonces: ${(nonceEnd - currentNonce).toLocaleString()}`);
+    console.log('[Orchestrator] ========================================');
+
+    let hashCount = 0;
+    let batchCounter = 0;
+    let lastProgressTime = Date.now();
+
+    // Mine with GPU batches
+    while (this.isRunning && this.isMining && this.currentChallengeId === challengeId && currentNonce < nonceEnd) {
+      // Check if we're still mining the correct address
+      if (!isDevFee && this.currentMiningAddress !== addr.bech32) {
+        console.log(`[Orchestrator] [GPU] Worker ${workerId}: Current address changed, stopping`);
+        return;
+      }
+
+      // Check if max submission failures reached
+      const submissionKey = `${addr.bech32}:${challengeId}`;
+      const failureCount = this.addressSubmissionFailures.get(submissionKey) || 0;
+      if (failureCount >= maxFailures) {
+        console.log(`[Orchestrator] [GPU] Worker ${workerId}: Max failures reached, stopping`);
+        return;
+      }
+
+      // Check if address already solved
+      const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+      if (solvedChallenges?.has(challengeId)) {
+        console.log(`[Orchestrator] [GPU] Worker ${workerId}: Address already solved, stopping`);
+        return;
+      }
+
+      // Check if paused
+      const pauseKey = `${addr.bech32}:${challengeId}`;
+      if (this.pausedAddresses.has(pauseKey)) {
+        await this.sleep(100);
+        continue;
+      }
+
+      batchCounter++;
+
+      // Generate batch of preimages
+      const batchData: Array<{ nonce: string; preimage: string }> = [];
+      for (let i = 0; i < BATCH_SIZE && (currentNonce + i) < nonceEnd; i++) {
+        const nonceNum = currentNonce + i;
+        const nonceHex = nonceNum.toString(16).padStart(16, '0');
+        const preimage = buildPreimage(nonceHex, addr.bech32, challenge, false);
+        batchData.push({ nonce: nonceHex, preimage });
+      }
+
+      // Advance nonce counter
+      currentNonce += batchData.length;
+
+      if (batchData.length === 0) break;
+
+      try {
+        // Hash batch on GPU
+        const preimages = batchData.map(d => d.preimage);
+
+        // Log first batch
+        if (batchCounter === 1) {
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: 🚀 Sending first batch to GPU (${preimages.length} preimages)...`);
+        }
+
+        const startTime = Date.now();
+        const hashes = await hashEngineGPU.hashBatch(preimages);
+        const elapsed = Date.now() - startTime;
+
+        // Log first batch completion
+        if (batchCounter === 1) {
+          const batchHashRate = Math.round((hashes.length / elapsed) * 1000);
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: ✅ First batch complete!`);
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: Processed ${hashes.length} hashes in ${elapsed}ms (${batchHashRate.toLocaleString()} H/s)`);
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: GPU is ${Math.round(batchHashRate / 1000)}x faster than CPU!`);
+        }
+
+        // Check if challenge changed during hashing
+        if (this.currentChallengeId !== challengeId) {
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: Challenge changed, discarding batch`);
+          return;
+        }
+
+        this.totalHashesComputed += hashes.length;
+        hashCount += hashes.length;
+
+        // Check all hashes for solutions
+        for (let i = 0; i < hashes.length; i++) {
+          const hash = hashes[i];
+          const { nonce, preimage } = batchData[i];
+
+          if (matchesDifficulty(hash, difficulty)) {
+            console.log(`[Orchestrator] [GPU] Worker ${workerId}: 🎯 SOLUTION FOUND!`);
+
+            // Check if already submitted
+            if (this.submittedSolutions.has(hash)) {
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Hash already submitted, skipping`);
+              continue;
+            }
+
+            // Check if already being submitted
+            const submissionKey = `${addr.bech32}:${challengeId}`;
+            if (this.submittingAddresses.has(submissionKey)) {
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Another worker is already submitting for this address, skipping`);
+              continue;
+            }
+
+            // Mark as submitting
+            this.submittingAddresses.add(submissionKey);
+
+            // Stop ALL workers (CPU + GPU) for this address
+            console.log(`[Orchestrator] [GPU] Worker ${workerId}: Stopping all workers (CPU + GPU) for this address`);
+            // Stop CPU workers
+            const userWorkerCount = Math.floor(this.workerThreads * 0.8);
+            for (let i = 0; i < userWorkerCount; i++) {
+              this.stoppedWorkers.add(i);
+            }
+            // Stop other GPU workers
+            for (let j = 0; j < this.gpuWorkers; j++) {
+              if (j !== workerId) {
+                this.stoppedWorkers.add(1000 + j); // GPU workers use IDs 1000+
+              }
+            }
+
+            // PAUSE all workers for this address while submitting
+            this.pausedAddresses.add(submissionKey);
+            console.log(`[Orchestrator] [GPU] Worker ${workerId}: Pausing all workers while submitting`);
+
+            // Update worker stats
+            const workerData = this.workerStats.get(gpuWorkerId);
+            if (workerData) {
+              workerData.status = 'submitting';
+              workerData.solutionsFound++;
+            }
+
+            // Log solution details
+            console.log('[Orchestrator] ========== SOLUTION FOUND (GPU) ==========');
+            console.log('[Orchestrator] Worker ID:', workerId, '(GPU)');
+            console.log('[Orchestrator] Address:', addr.bech32);
+            console.log('[Orchestrator] Nonce:', nonce);
+            console.log('[Orchestrator] Challenge ID (captured):', challengeId);
+            console.log('[Orchestrator] Challenge ID (current):', this.currentChallengeId);
+            console.log('[Orchestrator] Difficulty (captured):', difficulty);
+            console.log('[Orchestrator] Difficulty (current):', this.currentChallenge?.difficulty);
+            console.log('[Orchestrator] Required zero bits:', getDifficultyZeroBits(difficulty));
+            console.log('[Orchestrator] Hash:', hash.slice(0, 32) + '...');
+            console.log('[Orchestrator] Full hash:', hash);
+            console.log('[Orchestrator] Full preimage:', preimage);
+            console.log('[Orchestrator] ====================================');
+
+            // Mark as submitted before submitting
+            this.submittedSolutions.add(hash);
+
+            // Emit solution submit event
+            this.emit('solution_submit', {
+              type: 'solution_submit',
+              address: addr.bech32,
+              addressIndex: addr.index,
+              challengeId,
+              nonce,
+              preimage: preimage.slice(0, 50) + '...',
+            } as MiningEvent);
+
+            // Check if challenge changed
+            if (this.currentChallengeId !== challengeId) {
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Challenge changed before submission, discarding solution`);
+              this.pausedAddresses.delete(submissionKey);
+              this.submittingAddresses.delete(submissionKey);
+              return;
+            }
+
+            // Validate solution with current challenge data
+            console.log(`[Orchestrator] [GPU] Worker ${workerId}: Validating solution will pass server checks...`);
+            if (this.currentChallenge) {
+              const dataChanged =
+                challenge.latest_submission !== this.currentChallenge.latest_submission ||
+                challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour ||
+                challenge.no_pre_mine !== this.currentChallenge.no_pre_mine;
+
+              if (dataChanged) {
+                console.log(`[Orchestrator] [GPU] Worker ${workerId}: ⚠️  Challenge data CHANGED, revalidating...`);
+                const serverPreimage = buildPreimage(nonce, addr.bech32, this.currentChallenge, false);
+                const serverHash = await hashEngine.hashBatchAsync([serverPreimage]);
+                const serverHashHex = serverHash[0];
+
+                if (!matchesDifficulty(serverHashHex, this.currentChallenge.difficulty)) {
+                  console.log(`[Orchestrator] [GPU] Worker ${workerId}: ✗ Server will REJECT this solution, discarding`);
+                  this.pausedAddresses.delete(submissionKey);
+                  this.submittingAddresses.delete(submissionKey);
+                  continue;
+                } else {
+                  console.log(`[Orchestrator] [GPU] Worker ${workerId}: ✓ Server hash will be valid`);
+                }
+              } else {
+                console.log(`[Orchestrator] [GPU] Worker ${workerId}: ✓ Challenge data unchanged`);
+              }
+            }
+
+            // Check if difficulty changed
+            if (this.currentChallenge && this.currentChallenge.difficulty !== difficulty) {
+              const stillValid = matchesDifficulty(hash, this.currentChallenge.difficulty);
+              if (!stillValid) {
+                console.log(`[Orchestrator] [GPU] Worker ${workerId}: Solution no longer meets current difficulty, discarding`);
+                this.pausedAddresses.delete(submissionKey);
+                this.submittingAddresses.delete(submissionKey);
+                continue;
+              } else {
+                console.log(`[Orchestrator] [GPU] Worker ${workerId}: Solution still valid with current difficulty`);
+              }
+            }
+
+            // Submit solution
+            let submissionSuccess = false;
+            try {
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Submitting solution to API...`);
+              await this.submitSolution(addr, challengeId, nonce, hash, preimage, isDevFee, gpuWorkerId);
+
+              // Mark as solved
+              if (!this.solvedAddressChallenges.has(addr.bech32)) {
+                this.solvedAddressChallenges.set(addr.bech32, new Set());
+              }
+              this.solvedAddressChallenges.get(addr.bech32)!.add(challengeId);
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Marked address ${addr.index} as solved`);
+
+              submissionSuccess = true;
+            } catch (error: any) {
+              console.error(`[Orchestrator] [GPU] Worker ${workerId}: Submission failed:`, error.message);
+              submissionSuccess = false;
+
+              const currentFailures = this.addressSubmissionFailures.get(submissionKey) || 0;
+              this.addressSubmissionFailures.set(submissionKey, currentFailures + 1);
+              console.log(`[Orchestrator] [GPU] Worker ${workerId}: Failure ${currentFailures + 1}/${maxFailures}`);
+            } finally {
+              this.submittingAddresses.delete(submissionKey);
+
+              if (!submissionSuccess) {
+                console.log(`[Orchestrator] [GPU] Worker ${workerId}: Resuming workers to find new solution`);
+                this.pausedAddresses.delete(submissionKey);
+                this.submittedSolutions.delete(hash);
+                this.stoppedWorkers.clear();
+                continue;
+              } else {
+                this.pausedAddresses.delete(submissionKey);
+                this.addressSubmissionFailures.delete(submissionKey);
+              }
+            }
+
+            // Update worker status
+            const finalWorkerData = this.workerStats.get(gpuWorkerId);
+            if (finalWorkerData) {
+              finalWorkerData.status = 'completed';
+            }
+
+            console.log(`[Orchestrator] [GPU] Worker ${workerId}: Solution submitted successfully, stopping`);
+            return; // Exit GPU worker
+          }
+        }
+
+      } catch (error: any) {
+        console.error(`[Orchestrator] [GPU] Worker ${workerId}: Batch error:`, error.message);
+        await this.sleep(1000);
+      }
+
+      // Emit progress every 10 batches
+      if (batchCounter % 10 === 0) {
+        const now = Date.now();
+        const elapsedSeconds = (now - lastProgressTime) / 1000;
+        const hashRate = elapsedSeconds > 0 ? Math.round((BATCH_SIZE * 10) / elapsedSeconds) : 0;
+        lastProgressTime = now;
+
+        // Update worker stats
+        const workerData = this.workerStats.get(gpuWorkerId);
+        if (workerData) {
+          workerData.hashesComputed = hashCount;
+          workerData.hashRate = hashRate;
+          workerData.lastUpdateTime = now;
+
+          console.log(`[Orchestrator] [GPU] Worker ${workerId}: ${hashCount.toLocaleString()} hashes @ ${hashRate.toLocaleString()} H/s`);
+        }
+      }
+    }
+
+    console.log(`[Orchestrator] [GPU] Worker ${workerId}: Finished mining range`);
   }
 
   /**

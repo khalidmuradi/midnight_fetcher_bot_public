@@ -110,6 +110,11 @@ impl Rom {
         <&[u8; DATASET_ACCESS_SIZE]>::try_from(&self.data[start..start + DATASET_ACCESS_SIZE])
             .unwrap()
     }
+
+    /// Get ROM data (for GPU upload)
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 

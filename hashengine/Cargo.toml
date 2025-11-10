@@ -37,11 +37,15 @@ num_cpus = "1.16"
 # Performance: Fast memory allocator
 mimalloc = "0.1"
 
+# CUDA GPU acceleration (optional)
+cudarc = { version = "0.11", features = ["cuda-12050", "driver", "nvrtc"], optional = true }
+
 [build-dependencies]
 
 [features]
 default = ["napi-bindings"]
 napi-bindings = ["napi", "napi-derive"]
+gpu = ["cudarc"]
 
 [profile.release]
 lto = "fat"              # More aggressive LTO (Link Time Optimization)

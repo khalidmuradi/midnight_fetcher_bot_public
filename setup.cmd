@@ -5,11 +5,13 @@ REM ============================================================================
 REM This script performs complete setup:
 REM 1. Checks/installs Node.js 20.x
 REM 2. Verifies pre-built hash server executable exists
-REM 3. Installs all dependencies
-REM 4. Builds NextJS application
-REM 5. Opens browser and starts the app
+REM 3. Detects CUDA GPU and offers optional GPU build
+REM 4. Installs all dependencies
+REM 5. Builds NextJS application
+REM 6. Opens browser and starts the app
 REM
 REM NOTE: Rust toolchain is NOT required - using pre-built hash-server.exe
+REM GPU MINING: Optional - detected automatically if CUDA Toolkit installed
 REM ============================================================================
 
 setlocal enabledelayedexpansion
@@ -113,12 +115,94 @@ if not exist "hashengine\target\release\hash-server.exe" (
 echo Pre-built hash server found!
 echo.
 
+REM ============================================================================
+REM Check for GPU/CUDA and HashEngine Build Options
+REM ============================================================================
+echo [3/6] Checking HashEngine build options...
+
+REM Check if index.node already exists (GPU or CPU build)
+if exist "index.node" (
+    echo HashEngine library already exists: index.node
+    echo.
+    set /p REBUILD_HASHENGINE="Rebuild HashEngine? This will overwrite existing build. (y/N): "
+    if /i "!REBUILD_HASHENGINE!" neq "y" (
+        echo Skipping HashEngine rebuild. Using existing index.node
+        echo.
+        goto install_deps
+    )
+    echo.
+)
+
+REM Check for CUDA GPU support
+where nvcc >nul 2>&1
+if %errorlevel% equ 0 (
+    echo CUDA Toolkit detected!
+    nvcc --version | findstr /C:"release"
+    echo.
+    echo GPU mining is available!
+    echo.
+    set /p BUILD_WITH_GPU="Build HashEngine with GPU support? (y/N): "
+    if /i "!BUILD_WITH_GPU!"=="y" (
+        echo.
+        echo Building HashEngine with GPU support...
+        set SKIP_CUDA_CHECK=1
+        call build-gpu.cmd
+        if %errorlevel% neq 0 (
+            echo WARNING: GPU build failed. Continuing with setup...
+            echo You can retry GPU build later with: build-gpu.cmd
+            echo.
+            pause
+        ) else (
+            echo GPU build successful!
+            echo.
+        )
+        goto install_deps
+    )
+)
+
+REM Build CPU-only version (no GPU or user declined)
+echo Building HashEngine (CPU-only)...
+echo.
+where cargo >nul 2>&1
+if %errorlevel% neq 0 (
+    echo ERROR: Rust/Cargo not found. Cannot build HashEngine.
+    echo.
+    echo Please install Rust from https://rustup.rs/
+    echo Then run setup.cmd again.
+    echo.
+    pause
+    exit /b 1
+)
+
+cd hashengine
+cargo build --release
+if %errorlevel% neq 0 (
+    echo ERROR: HashEngine build failed!
+    cd ..
+    pause
+    exit /b 1
+)
+cd ..
+
+REM Copy CPU build to index.node
+if exist "hashengine\target\release\HashEngine_napi.dll" (
+    copy /Y "hashengine\target\release\HashEngine_napi.dll" "index.node"
+    echo HashEngine (CPU) built successfully!
+    echo.
+) else (
+    echo ERROR: Build output not found!
+    pause
+    exit /b 1
+)
+
+goto install_deps
+
 :install_deps
 
 REM ============================================================================
 REM Install dependencies
 REM ============================================================================
-echo [3/5] Installing project dependencies...
+echo [4/6] Installing project dependencies...
 call npm install
 if %errorlevel% neq 0 (
     echo ERROR: Failed to install dependencies
@@ -131,7 +215,7 @@ echo.
 REM ============================================================================
 REM Create required directories
 REM ============================================================================
-echo [4/5] Creating required directories...
+echo [5/6] Creating required directories...
 if not exist "secure" mkdir secure
 if not exist "storage" mkdir storage
 if not exist "logs" mkdir logs
@@ -144,7 +228,7 @@ echo ===========================================================================
 echo                         Setup Complete!
 echo ================================================================================
 echo.
-echo [5/5] Starting services...
+echo [6/6] Starting services...
 echo.
 
 REM Start hash server in background
@@ -179,10 +263,24 @@ echo.
 echo Hash Service: http://127.0.0.1:9001/health
 echo Web Interface: http://localhost:3000
 echo.
+echo Mining Status:
+where nvcc >nul 2>&1
+if %errorlevel% equ 0 (
+    if exist "index.node" (
+        echo   - GPU Mining: Available ^(CUDA detected, library built^)
+    ) else (
+        echo   - GPU Mining: Available ^(CUDA detected, run build-gpu.cmd^)
+    )
+) else (
+    echo   - GPU Mining: Not available ^(CUDA not installed^)
+)
+echo   - CPU Mining: Enabled
+echo.
 echo The application will open in your default browser.
 echo Press Ctrl+C to stop the Next.js server (hash server will continue running)
 echo.
 echo To stop hash server: taskkill /F /IM hash-server.exe
+echo GPU Setup Guide: GPU_QUICKSTART.md
 echo ================================================================================
 echo.
 
