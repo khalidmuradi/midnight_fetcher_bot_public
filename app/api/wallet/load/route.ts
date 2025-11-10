@@ -3,7 +3,7 @@ import { WalletManager } from '@/lib/wallet/manager';
 
 export async function POST(request: NextRequest) {
   try {
-    const { password } = await request.json();
+    const { password, mfaCode } = await request.json();
 
     if (!password) {
       return NextResponse.json(
@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const addresses = await manager.loadWallet(password);
+    const addresses = await manager.loadWallet(password, mfaCode);
 
     return NextResponse.json({
       success: true,

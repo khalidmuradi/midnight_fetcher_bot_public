@@ -7,6 +7,16 @@ export interface EncryptedData {
   tag: string;
 }
 
+export interface MFAData {
+  secret: string;
+  otpauth_url: string;
+}
+
+export interface MFASecret {
+  secret: string;
+  otpauth_url: string;
+}
+
 const ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
 const IV_LENGTH = 16;
@@ -67,4 +77,20 @@ export function decrypt(encrypted: EncryptedData, passphrase: string): string {
   plaintext += decipher.final('utf8');
 
   return plaintext;
+}
+
+/**
+ * Encrypt MFA secret with passphrase using AES-256-GCM
+ */
+export function encryptMFASecret(mfaSecret: MFASecret, passphrase: string): EncryptedData {
+  const plaintext = JSON.stringify(mfaSecret);
+  return encrypt(plaintext, passphrase);
+}
+
+/**
+ * Decrypt MFA secret with passphrase using AES-256-GCM
+ */
+export function decryptMFASecret(encrypted: EncryptedData, passphrase: string): MFASecret {
+  const plaintext = decrypt(encrypted, passphrase);
+  return JSON.parse(plaintext);
 }

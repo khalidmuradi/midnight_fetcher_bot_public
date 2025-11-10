@@ -14,7 +14,7 @@ if (!fs.existsSync(LOG_DIR)) {
 }
 
 type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG';
-type LogCategory = 'mining' | 'wallet' | 'hash' | 'api' | 'general';
+type LogCategory = 'mining' | 'wallet' | 'hash' | 'api' | 'general' | 'mfa';
 
 interface LogEntry {
   timestamp: string;

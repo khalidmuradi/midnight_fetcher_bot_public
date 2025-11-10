@@ -3,7 +3,7 @@ import { WalletManager } from '@/lib/wallet/manager';
 
 export async function POST(request: NextRequest) {
   try {
-    const { password, count } = await request.json();
+    const { password, count, enableMFA } = await request.json();
 
     if (!password || password.length < 8) {
       return NextResponse.json(
@@ -31,13 +31,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const walletInfo = await manager.generateWallet(password, walletCount);
+    const walletInfo = await manager.generateWallet(password, walletCount, enableMFA);
 
     return NextResponse.json({
       success: true,
       seedPhrase: walletInfo.seedPhrase,
       addressCount: walletInfo.addresses.length,
       primaryAddress: walletInfo.addresses[0]?.bech32,
+      mfa: walletInfo.mfa ? {
+        secret: walletInfo.mfa.secret,
+        otpauth_url: walletInfo.mfa.otpauth_url,
+        enabled: true
+      } : { enabled: false },
     });
   } catch (error: any) {
     console.error('[API] Wallet creation error:', error);

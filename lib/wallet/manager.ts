@@ -1,11 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import { Lucid, toHex } from 'lucid-cardano';
-import { encrypt, decrypt, EncryptedData } from './encryption';
+import speakeasy from 'speakeasy';
+import { encrypt, decrypt, encryptMFASecret, decryptMFASecret, EncryptedData, MFASecret } from './encryption';
+import Logger from '../utils/logger';
 
 const SECURE_DIR = path.join(process.cwd(), 'secure');
 const SEED_FILE = path.join(SECURE_DIR, 'wallet-seed.json.enc');
 const DERIVED_ADDRESSES_FILE = path.join(SECURE_DIR, 'derived-addresses.json');
+const MFA_SECRET_FILE = path.join(SECURE_DIR, 'mfa-secret.json.enc');
 
 export interface DerivedAddress {
   index: number;
@@ -17,6 +20,10 @@ export interface DerivedAddress {
 export interface WalletInfo {
   seedPhrase: string;
   addresses: DerivedAddress[];
+  mfa?: {
+    secret: string;
+    otpauth_url: string;
+  };
 }
 
 export class WalletManager {
@@ -26,7 +33,7 @@ export class WalletManager {
   /**
    * Generate a new wallet with 24-word seed phrase
    */
-  async generateWallet(password: string, count: number = 40): Promise<WalletInfo> {
+  async generateWallet(password: string, count: number = 40, enableMFA: boolean = false): Promise<WalletInfo> {
     // Ensure secure directory exists
     if (!fs.existsSync(SECURE_DIR)) {
       fs.mkdirSync(SECURE_DIR, { recursive: true, mode: 0o700 });
@@ -55,16 +62,40 @@ export class WalletManager {
       { mode: 0o600 }
     );
 
+    let mfaInfo;
+    if (enableMFA) {
+      // Generate MFA secret
+      const mfaSecret = speakeasy.generateSecret({
+        name: 'Midnight Fetcher Bot',
+        issuer: 'Midnight Fetcher'
+      });
+
+      // Encrypt and save MFA secret
+      const encryptedMFASecret = encryptMFASecret({
+        secret: mfaSecret.base32,
+        otpauth_url: mfaSecret.otpauth_url!
+      }, password);
+      fs.writeFileSync(MFA_SECRET_FILE, JSON.stringify(encryptedMFASecret, null, 2), { mode: 0o600 });
+
+      mfaInfo = {
+        secret: mfaSecret.base32,
+        otpauth_url: mfaSecret.otpauth_url!
+      };
+
+      Logger.log('mfa', 'MFA secret generated and encrypted for new wallet');
+    }
+
     return {
       seedPhrase: this.mnemonic,
       addresses: this.derivedAddresses,
+      mfa: mfaInfo,
     };
   }
 
   /**
    * Load existing wallet from encrypted file
    */
-  async loadWallet(password: string): Promise<DerivedAddress[]> {
+  async loadWallet(password: string, mfaCode?: string): Promise<DerivedAddress[]> {
     if (!fs.existsSync(SEED_FILE)) {
       throw new Error('No wallet found. Please create a new wallet first.');
     }
@@ -75,6 +106,30 @@ export class WalletManager {
       this.mnemonic = decrypt(encryptedData, password);
     } catch (err) {
       throw new Error('Failed to decrypt wallet. Incorrect password?');
+    }
+
+    // Check if MFA is enabled for this wallet
+    if (fs.existsSync(MFA_SECRET_FILE)) {
+      if (!mfaCode) {
+        throw new Error('MFA code is required for this wallet.');
+      }
+
+      const encryptedMFASecret: EncryptedData = JSON.parse(fs.readFileSync(MFA_SECRET_FILE, 'utf8'));
+      const mfaSecret: MFASecret = decryptMFASecret(encryptedMFASecret, password);
+
+      const verified = speakeasy.totp.verify({
+        secret: mfaSecret.secret,
+        encoding: 'base32',
+        token: mfaCode,
+        window: 2 // Allow 2 time windows (30 seconds each) for clock skew
+      });
+
+      if (!verified) {
+        Logger.error('mfa', 'MFA verification failed', { success: false });
+        throw new Error('Invalid MFA code.');
+      }
+
+      Logger.log('mfa', 'MFA verification successful');
     }
 
     // Load derived addresses if they exist
